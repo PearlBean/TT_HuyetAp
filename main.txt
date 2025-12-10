@@ -1,0 +1,364 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ================= LCD =================
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ================= HX710B =================
+const int dataPin  = PA0;   // DOUT
+const int clockPin = PA1;   // SCK
+
+// ================= TB6612 =================
+#define PWMA PA10
+#define AIN1 PB8
+#define AIN2 PB9
+
+// ================= BUTTON =================
+#define BTN_RUN  PA9   // START
+
+// ================= CALIB =================
+long  OFFSET = 0;
+// SCALE bạn đang dùng
+float SCALE  = 0.0000065;   // kPa / raw 0.0000065
+
+// ================= INFLATION-MODE CONFIG =================
+int   PUMP_PWM        = 180;      // độ mạnh bơm
+long  MAX_INFLATE_MS  = 15000;    // bơm tối đa 15s
+long  BLANK_MS        = 700;      // 0.7s đầu không đọc sensor
+float TARGET_STOP_P   = 180.0;    // áp dừng bơm (mmHg)
+float SAFE_MAX_P      = 200.0;    // quá ngưỡng này thì dừng vì an toàn
+
+// ================= OSCILLOMETRIC CONFIG =================
+#define MAX_SAMPLES        400
+int   MIN_SAMPLES_FOR_BP  = 30;   // tối thiểu số mẫu để tính BP
+int   SAMPLE_PERIOD_MS    = 20;   // ~50Hz
+
+float pressures[MAX_SAMPLES];     // áp tức thời (mmHg)
+float oscillations[MAX_SAMPLES];  // biên độ dao động
+int   sampleCount = 0;
+
+// =========== STATE ===========
+enum State {
+  IDLE,
+  INFLATE_MEASURE,
+  FINISHED
+};
+
+State state = IDLE;
+
+// ========= TIME VARS =========
+unsigned long inflateStartTime   = 0;
+unsigned long lastSampleTime     = 0;
+
+// ========= BASELINE FILTER =========
+float baseline = 0.0f;
+bool  firstSample = true;
+
+// ================== SENSOR READY ==================
+bool waitForHXReady(unsigned long timeout_ms) {
+  unsigned long t0 = millis();
+  while (digitalRead(dataPin) == HIGH) {
+    if (millis() - t0 > timeout_ms) return false;
+  }
+  return true;
+}
+
+// ================== READ HX710B ==================
+bool readHX710B(long &resultOut) {
+  if (!waitForHXReady(200)) return false;
+
+  long result = 0;
+  for (int i = 0; i < 24; i++) {
+    digitalWrite(clockPin, HIGH);
+    result = (result << 1) | digitalRead(dataPin);
+    digitalWrite(clockPin, LOW);
+  }
+
+  digitalWrite(clockPin, HIGH);
+  delayMicroseconds(1);
+  digitalWrite(clockPin, LOW);
+
+  if (result & 0x800000) result |= 0xFF000000;
+  resultOut = result;
+  return true;
+}
+
+// đọc 1 lần, trả về mmHg, nếu lỗi trả -1
+float readPressureOnce() {
+  long raw;
+  if (!readHX710B(raw)) return -1.0;
+
+  float kPa = (raw - OFFSET) * SCALE;
+  if (kPa < 0) kPa = 0;
+  return kPa * 7.50062;
+}
+
+// ================= MOTOR =================
+void motorStop() {
+  analogWrite(PWMA, 0);
+  digitalWrite(AIN1, LOW);
+  digitalWrite(AIN2, LOW);
+}
+
+void motorForward(int pwm) {
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(AIN2, LOW);
+  analogWrite(PWMA, pwm);
+}
+
+// ================= LCD HELPERS =================
+void lcdSafeInit() {
+  lcd.init();
+  lcd.backlight();
+}
+
+void lcdShowIdle() {
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("BP READY");
+  lcd.setCursor(0,1);
+  lcd.print("RUN=start");
+}
+
+void lcdShowStart() {
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("INFLATING");
+  lcd.setCursor(0,1);
+  lcd.print("Measuring...");
+}
+
+void lcdShowMeasErr() {
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("MEAS ERR");
+  lcd.setCursor(0,1);
+  lcd.print("Try again");
+}
+
+// ================= COMPUTE BP (INFLATION MODE) =============
+void computeBP(float &sys, float &dia, float &mapP) {
+  if (sampleCount < MIN_SAMPLES_FOR_BP) {
+    sys = dia = mapP = 0;
+    return;
+  }
+
+  // 1) Tìm biên độ dao động max
+  float maxA = 0;
+  int idxMax = 0;
+  for (int i = 0; i < sampleCount; i++) {
+    if (oscillations[i] > maxA) {
+      maxA = oscillations[i];
+      idxMax = i;
+    }
+  }
+
+  // Nếu đỉnh nằm sát đầu/cuối thì coi như dữ liệu xấu
+  if (idxMax < 3 || idxMax > sampleCount - 3) {
+    sys = dia = mapP = 0;
+    return;
+  }
+
+  // 2) Chọn hệ số ngưỡng cho inflation mode
+  // dao động tăng dần theo áp, nên:
+  // - kDia THẤP hơn -> gặp sớm -> áp thấp hơn
+  // - kSys CAO hơn -> gặp trễ -> áp cao hơn
+  float kDia = 0.40f;   // ngưỡng biên độ cho DIA
+  float kSys = 0.80f;   // ngưỡng biên độ cho SYS
+
+  bool diaFound = false;
+  bool sysFound = false;
+
+  dia = pressures[0];
+  sys = pressures[idxMax];
+
+  // duyệt bên trái đỉnh (0 -> idxMax)
+  for (int i = 0; i <= idxMax; i++) {
+    float a = oscillations[i];
+
+    if (!diaFound && a >= kDia * maxA) {
+      dia = pressures[i];
+      diaFound = true;
+    }
+
+    if (!sysFound && a >= kSys * maxA) {
+      sys = pressures[i];
+      sysFound = true;
+    }
+  }
+
+  // Nếu chưa tìm được SYS thì lấy ngay tại đỉnh
+  if (!sysFound) {
+    sys = pressures[idxMax];
+  }
+
+  // Đảm bảo SYS luôn >= DIA
+  if (sys < dia) {
+    float t = sys;
+    sys = dia;
+    dia = t;
+  }
+
+  // 3) Tính MAP theo công thức y khoa: luôn nằm giữa SYS và DIA
+  mapP = dia + (sys - dia) / 3.0f;
+}
+
+
+
+// ================= SETUP =================
+void setup() {
+  pinMode(dataPin, INPUT);
+  pinMode(clockPin, OUTPUT);
+
+  pinMode(PWMA, OUTPUT);
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+
+  pinMode(BTN_RUN, INPUT_PULLUP);
+
+  Wire.begin();
+  Wire.setClock(50000);   // I2C chậm lại chống nhiễu
+
+  lcdSafeInit();
+
+  // Zero OFFSET
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("Zeroing...");
+  
+  long sum = 0;
+  int okCount = 0;
+
+  for (int i = 0; i < 30; i++) {
+    long r;
+    if (readHX710B(r)) {
+      sum += r;
+      okCount++;
+    }
+    delay(50);
+  }
+
+  if (okCount == 0) {
+    lcd.clear();
+    lcd.print("Sensor Fail");
+    while(1);
+  }
+
+  OFFSET = sum / okCount;
+  delay(500);
+
+  lcdShowIdle();
+  state = IDLE;
+}
+
+// ================= LOOP =================
+void loop() {
+
+  switch (state) {
+
+    // ------------------------------------
+    case IDLE:
+      if (digitalRead(BTN_RUN) == LOW) {
+        sampleCount = 0;
+        baseline    = 0;
+        firstSample = true;
+
+        inflateStartTime = millis();
+        lastSampleTime   = inflateStartTime;
+
+        lcdShowStart();
+        delay(200);
+
+        motorForward(PUMP_PWM);
+        state = INFLATE_MEASURE;
+      }
+      break;
+
+    // ------------------------------------
+    case INFLATE_MEASURE: {
+      unsigned long now = millis();
+
+      // giới hạn thời gian bơm max
+      if (now - inflateStartTime > MAX_INFLATE_MS) {
+        motorStop();
+        state = FINISHED;
+        break;
+      }
+
+      // Sau BLANK_MS mới đọc sensor
+      if (now - inflateStartTime < BLANK_MS) {
+        break;
+      }
+
+      // Lấy mẫu áp theo chu kỳ
+      if (now - lastSampleTime >= (unsigned long)SAMPLE_PERIOD_MS) {
+        lastSampleTime = now;
+
+        float p = readPressureOnce();
+        if (p <= 0) {
+          // lỗi sensor hoặc áp rất thấp -> không lưu
+          break;
+        }
+
+        // KHÔNG lưu mẫu quá nhỏ (<20mmHg) vì không hữu ích cho BP
+        bool keepSample = (p >= 20.0f);
+
+        // cập nhật baseline
+        if (firstSample) {
+          baseline = p;
+          firstSample = false;
+        } else {
+          const float alpha = 0.97f;
+          baseline = alpha * baseline + (1.0f - alpha) * p;
+        }
+
+        float osc = fabs(p - baseline);
+
+        if (keepSample && sampleCount < MAX_SAMPLES) {
+          pressures[sampleCount]    = p;
+          oscillations[sampleCount] = osc;
+          sampleCount++;
+        }
+
+        // Điều kiện dừng bơm
+        if (p >= TARGET_STOP_P || p >= SAFE_MAX_P || sampleCount >= MAX_SAMPLES) {
+          motorStop();
+          state = FINISHED;
+        }
+      }
+
+      break;
+    }
+
+    // ------------------------------------
+    case FINISHED: {
+      // Motor đã tắt, chống nhiễu: chờ nguồn ổn rồi re-init LCD
+      delay(1000);
+      lcdSafeInit();
+
+      float sys, dia, mapP;
+      computeBP(sys, dia, mapP);
+
+      if (sys == 0 && dia == 0 && mapP == 0) {
+        lcdShowMeasErr();
+      } else {
+        lcd.clear();
+        lcd.setCursor(0,0);
+        lcd.print("S:");
+        lcd.print(sys,0);
+        lcd.print(" D:");
+        lcd.print(dia,0);
+
+        lcd.setCursor(0,1);
+        lcd.print("M:");
+        lcd.print(mapP,0);
+        lcd.print("mmHg");
+      }
+
+      delay(6000);
+      lcdShowIdle();
+      state = IDLE;
+      break;
+    }
+  }
+}
